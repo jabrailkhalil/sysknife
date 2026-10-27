@@ -1,5 +1,5 @@
 ---
-name: Risk prose validation
+name: Risk prose live Ubuntu VM
 
 on:
   push:
@@ -9,71 +9,141 @@ permissions:
   contents: read
 
 jobs:
-  finish-hygiene:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+  live-ubuntu:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
     defaults:
       run:
         working-directory: source
+    env:
+      UBUNTU_RELEASE: noble
+      UBUNTU_VM_MEM: "4096"
+      UBUNTU_VM_CPUS: "2"
+      UBUNTU_VM_DISK: "28G"
+      SYSKNIFE_VM_SSH_KEY: ${{ runner.temp }}/sysknife-pr695-vm
+      SYSKNIFE_LLM_PROVIDER: ollama
+      SYSKNIFE_LLM_MODEL: sysknife-pr695
+      SYSKNIFE_OLLAMA_URL: http://127.0.0.1:11434
+      SYSKNIFE_CASSETTE_MODE: record
+      SYSKNIFE_ALLOW_DESTRUCTIVE: "1"
     steps:
       - name: Checkout validation harness
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           path: harness
+          persist-credentials: false
       - name: Checkout exact upstream base
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           repository: lacs-project/sysknife
           ref: 24ebd624b740debfb1614327b09e281cbcb8f496
+          fetch-depth: 0
           path: source
           persist-credentials: false
-      - name: Install pinned Python tools
-        run: pip install --require-hashes -r tools/ci-python/requirements.txt
-      - name: Reproduce both validation-environment faults on untouched main
+      - name: Check remote hardware and KVM
         run: |
           set -euo pipefail
           mkdir -p ../evidence
-          test "$(git rev-parse HEAD)" = 24ebd624b740debfb1614327b09e281cbcb8f496
+          { uname -a; lscpu; free -h; df -h; ls -l /dev/kvm; } | tee ../evidence/host.txt
+          test -c /dev/kvm
+          if ! test -r /dev/kvm || ! test -w /dev/kvm; then
+            sudo setfacl -m "u:$(id -un):rw" /dev/kvm
+          fi
+          test -r /dev/kvm
+          test -w /dev/kvm
+      - name: Install VM host tools
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y qemu-system-x86 qemu-utils genisoimage rsync netcat-openbsd jq bc acl
+      - name: Install the project's pinned Ollama and controlled model
+        run: |
+          set -euo pipefail
+          source tests/e2e/pinned-installers.sh
+          pinned_install_ollama
+          sudo systemctl stop ollama
+          nohup env OLLAMA_HOST=127.0.0.1:11434 OLLAMA_CONTEXT_LENGTH=16384 \
+            OLLAMA_NUM_PARALLEL=1 ollama serve > ../evidence/ollama.log 2>&1 &
+          for attempt in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:11434/api/tags > /dev/null; then break; fi
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:11434/api/tags
+          ollama pull llama3.2:3b
+          ollama create sysknife-pr695 -f ../harness/validation/Ollama.Modelfile
+          ollama --version | tee ../evidence/ollama-version.txt
+          curl -sf http://127.0.0.1:11434/api/tags > ../evidence/model-digests.json
+          ollama show sysknife-pr695 --modelfile > ../evidence/model-config.txt
+      - name: Boot a real Ubuntu 24.04 cloud-image VM
+        run: |
+          set -euo pipefail
+          bash tests/e2e/ubuntu-vm.sh download 2>&1 | tee ../evidence/vm-download.log
+          sha256sum "$HOME/.cache/sysknife-vms/noble-server-cloudimg-amd64.img" > ../evidence/cloud-image.sha256
+          bash tests/e2e/ubuntu-vm.sh install 2>&1 | tee ../evidence/vm-install.log
+          bash tests/e2e/ubuntu-vm.sh sync
+          bash tests/e2e/ubuntu-vm.sh ssh 'cd /home/ubuntu/sysknife && git fetch --depth=2 https://github.com/jabrailkhalil/sysknife.git b6b2704f6b2a515670fdc974b87e361f0b595adb && git checkout --detach 24ebd624b740debfb1614327b09e281cbcb8f496'
+      - name: Provision the unmodified baseline through the repository VM path
+        run: |
+          set -euo pipefail
+          bash tests/e2e/ubuntu-vm.sh provision 2>&1 | tee ../evidence/vm-provision.log
+          bash tests/e2e/ubuntu-vm.sh ssh 'cd /home/ubuntu/sysknife && git diff --exit-code && git rev-parse HEAD && cat /etc/os-release && systemctl is-active sysknife-daemon && /usr/local/bin/sysknife --version' | tee ../evidence/guest-baseline.txt
+          ssh -fNT -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
+            -i "$SYSKNIFE_VM_SSH_KEY" -o IdentitiesOnly=yes -o BatchMode=yes \
+            -p 2223 -R 11434:127.0.0.1:11434 ubuntu@127.0.0.1
+          bash tests/e2e/ubuntu-vm.sh ssh 'curl -sf http://127.0.0.1:11434/api/tags'
+      - name: Live baseline probe for the affected autoremove scenario
+        run: |
+          set -euo pipefail
+          export SYSKNIFE_RESULTS_JSON=/tmp/pr695-evidence/base-probe/results.json
+          export SYSKNIFE_CASSETTE=/tmp/pr695-evidence/base-probe/calls.json
+          bash tests/e2e/ubuntu-vm.sh run 60 2>&1 | tee ../evidence/base-probe.log
+          bash tests/e2e/ubuntu-vm.sh ssh 'sudo tar -C /tmp/pr695-evidence -czf - .' > ../evidence/guest-probe.tar.gz
+      - name: Preserve the live probe before the full suite
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: risk-prose-live-probe
+          path: evidence/
+      - name: Run the complete Ubuntu story family on main
+        run: |
+          set -euo pipefail
+          export SYSKNIFE_RESULTS_JSON=/tmp/pr695-evidence/base/results.json
+          export SYSKNIFE_CASSETTE=/tmp/pr695-evidence/base/calls.json
           set +e
-          UPDATE_TEST_BASELINE=1 bash tests/release/test-baseline-provenance.test.sh > ../evidence/base-update-env.log 2>&1
-          baseline_status=$?
-          bash tests/release/mdbook-links.test.sh > ../evidence/base-missing-mdbook.log 2>&1
-          mdbook_status=$?
+          bash tests/e2e/ubuntu-vm.sh run ubuntu 2>&1 | tee ../evidence/base-full.log
+          result=${PIPESTATUS[0]}
           set -e
-          test "$baseline_status" != 0
-          grep -F 'FAIL: frontend count mismatch was accepted' ../evidence/base-update-env.log
-          test "$mdbook_status" != 0
-          grep -F 'mdbook and mdbook-admonish must be installed under CI' ../evidence/base-missing-mdbook.log
-      - name: Install the project's pinned mdBook tools
+          printf '%s\n' "$result" > ../evidence/base-full-exit.txt
+          bash tests/e2e/ubuntu-vm.sh ssh 'sudo cp -a /home/ubuntu/sysknife/tests/e2e/logs /tmp/pr695-evidence/base/logs'
+      - name: Install the exact PR head in the same VM
         run: |
           set -euo pipefail
-          curl -sSfL -o /tmp/mdbook.tar.gz https://github.com/rust-lang/mdBook/releases/download/v0.4.40/mdbook-v0.4.40-x86_64-unknown-linux-gnu.tar.gz
-          echo '9ef07fd288ba58ff3b99d1c94e6d414d431c9a61fdb20348e5beb74b823d546b /tmp/mdbook.tar.gz' | sha256sum --check --strict -
-          sudo tar -xzf /tmp/mdbook.tar.gz --directory /usr/local/bin
-          curl -sSfL -o /tmp/mdbook-admonish.tar.gz https://github.com/tommilligan/mdbook-admonish/releases/download/v1.18.0/mdbook-admonish-v1.18.0-x86_64-unknown-linux-gnu.tar.gz
-          echo '5d19ec6376c646204235f197c91398cf95873e96e6100982137112056da96fe4 /tmp/mdbook-admonish.tar.gz' | sha256sum --check --strict -
-          sudo tar -xzf /tmp/mdbook-admonish.tar.gz --directory /usr/local/bin
-      - name: Verify both hygiene checks on main with normal environment
+          bash tests/e2e/ubuntu-vm.sh ssh 'cd /home/ubuntu/sysknife && git checkout --detach b6b2704f6b2a515670fdc974b87e361f0b595adb && source /home/ubuntu/.cargo/env && cargo build --release -p sysknife-daemon -p sysknife-cli --locked && git diff --exit-code && sudo install -m 755 target/release/sysknife /usr/local/bin/sysknife && sudo install -m 755 target/release/sysknife-daemon /usr/local/bin/sysknife-daemon && sudo systemctl restart sysknife-daemon' 2>&1 | tee ../evidence/candidate-build.log
+          bash tests/e2e/ubuntu-vm.sh ssh 'cd /home/ubuntu/sysknife && git rev-parse HEAD && sha256sum crates/sysknife-brain/src/prompt.rs crates/sysknife-daemon/tests/prompt_risk_labels.rs && systemctl is-active sysknife-daemon' | tee ../evidence/guest-candidate.txt
+      - name: Run the complete Ubuntu story family on the PR head
         run: |
           set -euo pipefail
-          env -u UPDATE_TEST_BASELINE bash tests/release/test-baseline-provenance.test.sh 2>&1 | tee ../evidence/base-baseline-provenance.log
-          env -u UPDATE_TEST_BASELINE bash tests/release/mdbook-links.test.sh 2>&1 | tee ../evidence/base-mdbook.log
-      - name: Verify the unchanged tested Rust source and generated baseline
+          export SYSKNIFE_RESULTS_JSON=/tmp/pr695-evidence/candidate/results.json
+          export SYSKNIFE_CASSETTE=/tmp/pr695-evidence/candidate/calls.json
+          set +e
+          bash tests/e2e/ubuntu-vm.sh run ubuntu 2>&1 | tee ../evidence/candidate-full.log
+          result=${PIPESTATUS[0]}
+          set -e
+          printf '%s\n' "$result" > ../evidence/candidate-full-exit.txt
+          bash tests/e2e/ubuntu-vm.sh ssh 'sudo cp -a /home/ubuntu/sysknife/tests/e2e/logs /tmp/pr695-evidence/candidate/logs'
+          test "$result" = 0
+      - name: Collect guest evidence and diagnostics
+        if: always()
         run: |
-          set -euo pipefail
-          git apply --check ../harness/validation/risk-prose.patch
-          git apply ../harness/validation/risk-prose.patch
-          sha256sum --check ../harness/validation/expected-source.sha256
-          git diff --check
-          env -u UPDATE_TEST_BASELINE bash tests/release/test-baseline-provenance.test.sh 2>&1 | tee ../evidence/candidate-baseline-provenance.log
-          env -u UPDATE_TEST_BASELINE bash tests/release/mdbook-links.test.sh 2>&1 | tee ../evidence/candidate-mdbook.log
-      - name: Exercise the privileged action-step fixture required by CI
-        run: |
-          set -euo pipefail
-          sudo env PATH="$PATH" bash tests/release/action-steps.test.sh 2>&1 | tee ../evidence/privileged-action-steps.log
-          git diff --binary --output=../evidence/verified-source.patch
+          mkdir -p ../evidence
+          if test -f "$SYSKNIFE_VM_SSH_KEY"; then
+            bash tests/e2e/ubuntu-vm.sh ssh 'sudo tar -C /tmp/pr695-evidence -czf - .' > ../evidence/guest-evidence.tar.gz || true
+            bash tests/e2e/ubuntu-vm.sh ssh 'sudo journalctl -u sysknife-daemon --no-pager -n 300' > ../evidence/daemon-journal.log || true
+          fi
+      - name: Stop the test VM
+        if: always()
+        run: bash tests/e2e/ubuntu-vm.sh stop
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         if: always()
         with:
-          name: risk-prose-hygiene-repair
+          name: risk-prose-live-ubuntu
           path: evidence/
