@@ -1,3 +1,4 @@
+---
 name: Risk prose validation
 
 on:
@@ -8,51 +9,118 @@ permissions:
   contents: read
 
 jobs:
-  reproduce:
+  validate:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: sysknife
+          POSTGRES_PASSWORD: sysknife
+          POSTGRES_DB: sysknife_test
+        ports: [5432:5432]
+        options: >-
+          --health-cmd "pg_isready -U sysknife -d sysknife_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    defaults:
+      run:
+        working-directory: source
     env:
       CARGO_TERM_COLOR: never
       CARGO_INCREMENTAL: 0
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      SYSKNIFE_TEST_POSTGRES_URL: postgres://sysknife:sysknife@127.0.0.1:5432/sysknife_test?sslmode=disable
+      SYSKNIFE_REQUIRE_POSTGRES: "1"
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Checkout validation harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
-          fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable (branch)
+          path: harness
+      - name: Checkout exact upstream source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: lacs-project/sysknife
+          ref: 24ebd624b740debfb1614327b09e281cbcb8f496
+          path: source
+          persist-credentials: false
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev patchelf shellcheck
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8  # stable (branch)
         with:
           toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
         with:
+          workspaces: source -> ../target
           key: risk-prose-20261027
           cache-on-failure: true
-      - name: Apply uncommitted test patch to exact upstream base
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8  # v2.87.28
+        with:
+          tool: cargo-nextest,cargo-audit
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: "24"
+      - name: Install pinned hygiene tools
+        run: |
+          npm ci --prefix tools/ci-node
+          echo "$PWD/tools/ci-node/node_modules/.bin" >> "$GITHUB_PATH"
+          pip install --require-hashes -r tools/ci-python/requirements.txt
+      - name: Apply tested candidate patch
         run: |
           set -euo pipefail
-          git merge-base --is-ancestor 24ebd624b740debfb1614327b09e281cbcb8f496 HEAD
-          git diff --exit-code 24ebd624b740debfb1614327b09e281cbcb8f496 HEAD -- crates apps Cargo.toml Cargo.lock tests scripts
-          git apply --check validation/risk-prose.patch
-          git apply validation/risk-prose.patch
+          mkdir -p ../evidence
+          test "$(git rev-parse HEAD)" = 24ebd624b740debfb1614327b09e281cbcb8f496
+          git apply --check ../harness/validation/risk-prose.patch
+          git apply ../harness/validation/risk-prose.patch
           git diff --check
           cargo fmt --all -- --check
-      - name: Reproduce AptAutoremove contradiction before changing the prompt
+          sha256sum crates/sysknife-brain/src/prompt.rs \
+            crates/sysknife-daemon/tests/prompt_risk_labels.rs > ../evidence/source-sha256.txt
+      - name: Focused risk guards and each-line reversion controls
         run: |
           set -euo pipefail
-          mkdir -p evidence
-          git diff --binary -- crates > evidence/test-first.patch
+          cargo test -p sysknife-daemon --test prompt_risk_labels --locked -- --nocapture \
+            2>&1 | tee ../evidence/focused.log
+          python3 ../harness/validation/check-mutations.py
+      - name: Full repository checks and measured test baseline
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPDATE_TEST_BASELINE: "1"
+        run: |
+          set -euo pipefail
           set +e
-          cargo test -p sysknife-daemon --test prompt_risk_labels --locked \
-            prose_risk_claims_match_the_action_specs -- --exact --nocapture 2>&1 | tee evidence/red.log
-          status=${PIPESTATUS[0]}
+          bash scripts/ci-local.sh 2>&1 | tee ../evidence/ci-local.log
+          result=${PIPESTATUS[0]}
           set -e
-          test "$status" = 101
-          grep -F 'AptAutoremove: prose says Low, ActionSpec says Medium' evidence/red.log
-          grep -F 'test result: FAILED. 0 passed; 1 failed;' evidence/red.log
-          cargo test -p sysknife-daemon --test prompt_risk_labels --locked \
-            prose_claims_distinguish_negation_and_ambiguous_lines -- --exact --nocapture \
-            2>&1 | tee evidence/parser-controls.log
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+          printf '%s\n' "$result" > ../evidence/ci-local-exit.txt
+          ! grep -q '^FAIL ' ../evidence/ci-local.log
+          ! grep -q '^ci-local: FAIL' ../evidence/ci-local.log
+          ! grep -q 'missing-tool:' ../evidence/ci-local.log
+          ! grep -q '^SKIP .*postgres-contract' ../evidence/ci-local.log
+          if test "$result" != 0; then
+            grep -q '^ci-local: INCOMPLETE' ../evidence/ci-local.log
+            grep -q 'root-required:' ../evidence/ci-local.log
+          fi
+          bash scripts/check_test_reachability.sh --list-privileged > ../evidence/privileged-tests.txt
+          while IFS= read -r test_path; do
+            sudo -E env PATH="$PATH" bash "$test_path"
+          done < ../evidence/privileged-tests.txt
+      - name: Preserve measured source and evidence
+        if: always()
+        run: |
+          mkdir -p ../evidence/generated
+          git diff --binary --output=../evidence/measured-source.patch
+          git diff --name-only -z | while IFS= read -r -d '' changed; do
+            mkdir -p "../evidence/generated/$(dirname "$changed")"
+            cp -- "$changed" "../evidence/generated/$changed"
+          done
+          git status --short > ../evidence/source-status.txt
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         if: always()
         with:
-          name: risk-prose-reproduction
+          name: risk-prose-validation
           path: evidence/
