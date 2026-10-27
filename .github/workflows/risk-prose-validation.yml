@@ -1,0 +1,55 @@
+name: Risk prose validation
+
+on:
+  push:
+    branches: [validation/risk-prose-20261027]
+
+permissions:
+  contents: read
+
+jobs:
+  reproduce:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: never
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable (branch)
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: risk-prose-20261027
+          cache-on-failure: true
+      - name: Apply uncommitted test patch to exact upstream base
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = 24ebd624b740debfb1614327b09e281cbcb8f496
+          git apply --check validation/risk-prose.patch
+          git apply validation/risk-prose.patch
+          git diff --check
+          cargo fmt --all -- --check
+      - name: Reproduce AptAutoremove contradiction before changing the prompt
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          git diff --binary -- crates > evidence/test-first.patch
+          set +e
+          cargo test -p sysknife-daemon --test prompt_risk_labels --locked \
+            prose_risk_claims_match_the_action_specs -- --exact --nocapture 2>&1 | tee evidence/red.log
+          status=${PIPESTATUS[0]}
+          set -e
+          test "$status" = 101
+          grep -F 'AptAutoremove: prose says Low, ActionSpec says Medium' evidence/red.log
+          grep -F 'test result: FAILED. 0 passed; 1 failed;' evidence/red.log
+          cargo test -p sysknife-daemon --test prompt_risk_labels --locked \
+            prose_claims_distinguish_negation_and_ambiguous_lines -- --exact --nocapture \
+            2>&1 | tee evidence/parser-controls.log
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: risk-prose-reproduction
+          path: evidence/
