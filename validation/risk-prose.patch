@@ -129,3 +129,15 @@ index 984ca1d..473139d 100644
  /// The other place a risk level is written in prose: the doc comment above each
  /// action's spec.
  ///
+diff --git a/tests/evidence/workspace-tests.json b/tests/evidence/workspace-tests.json
+index 2696612..39e9d0e 100644
+--- a/tests/evidence/workspace-tests.json
++++ b/tests/evidence/workspace-tests.json
+@@ -4,6 +4,6 @@
+     "tests": "cargo nextest run --workspace --locked"
+   },
+   "frontend_tests": 72,
+-  "tests": 2020,
++  "tests": 2022,
+   "version": 2
+ }
