@@ -1,45 +1,64 @@
-use sysknife_brain::planning_tools::{get_state, preferences, propose_plan, query_tools, refuse};
-use sysknife_brain::prompt::build_system_prompt;
+use std::future::Future;
+use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+use std::task::{Context, Poll, Wake, Waker};
+use sysknife_brain::planner::{LlmPlanner, PlanningError};
+use sysknife_brain::provider::{Completion, LlmProvider, Message, ProviderError, ToolDefinition};
+use sysknife_brain::state_client::{CuratedState, StateClient};
 use sysknife_types::{DistroHint, DISTRO_FAMILY_DEBIAN};
 
-fn quote(value: &str) -> String {
-    let mut out = String::from("\"");
-    for character in value.chars() {
-        match character {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if c < ' ' => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
+struct Capture(Arc<AtomicUsize>);
+
+#[async_trait::async_trait]
+impl LlmProvider for Capture {
+    async fn complete(&self, system: &str, _: &[Message], tools: &[ToolDefinition], max_tokens: u32)
+        -> Result<Completion, ProviderError>
+    {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        let tools: Vec<_> = tools.iter().map(|tool| serde_json::json!({
+            "type": "function", "function": {"name": tool.name,
+            "description": tool.description, "parameters": tool.input_schema}
+        })).collect();
+        // Capture the real production factory output through its public provider
+        // boundary. No plan or successful provider reply is supplied here.
+        println!("{}", serde_json::json!({
+            "model": "sysknife-pr695", "stream": false, "keep_alive": "30m",
+            "max_tokens": max_tokens,
+            "messages": [{"role": "system", "content": system},
+                         {"role": "user", "content": "Acknowledge initialization briefly."}],
+            "tools": tools, "options": {"num_predict": 1}
+        }));
+        Err(ProviderError::Request("initialization request capture only".into()))
     }
-    out.push('"');
-    out
+}
+
+struct NoQueries;
+impl StateClient for NoQueries {
+    fn curated_state(&self) -> Result<CuratedState, PlanningError> {
+        panic!("prefix capture must not fabricate system state")
+    }
+    fn query_action(&self, _: &str, _: &serde_json::Value) -> Result<String, PlanningError> {
+        panic!("prefix capture must not fabricate query results")
+    }
+}
+
+struct NoopWake;
+impl Wake for NoopWake { fn wake(self: Arc<Self>) {} }
+fn run<F: Future>(future: F) -> F::Output {
+    let waker = Waker::from(Arc::new(NoopWake));
+    let mut context = Context::from_waker(&waker);
+    let mut future = Box::pin(future);
+    loop {
+        if let Poll::Ready(output) = future.as_mut().poll(&mut context) { return output; }
+        std::thread::yield_now();
+    }
 }
 
 fn main() {
-    let hint = DistroHint {
-        id: "ubuntu".into(),
-        family: DISTRO_FAMILY_DEBIAN,
-        version: Some("Ubuntu 24.04".into()),
-    };
-    let system = build_system_prompt(None, Some(&hint));
-    let mut tools = vec![get_state::get_state_tool_def()];
-    tools.extend(query_tools::query_tools_for_distro(Some(&hint)));
-    tools.push(preferences::remember_tool_def());
-    tools.push(preferences::forget_tool_def());
-    tools.push(propose_plan::propose_plan_tool_def(Some(&hint)));
-    tools.push(refuse::refuse_tool_def());
-    let serialized: Vec<String> = tools.iter().map(|tool| format!(
-        "{{\"type\":\"function\",\"function\":{{\"name\":{},\"description\":{},\"parameters\":{}}}}}",
-        quote(&tool.name), quote(&tool.description), tool.input_schema
-    )).collect();
-    // This is a one-token, neutral initialization request, never a story answer.
-    // The actual stories still run the unmodified CLI/harness with 600 seconds.
-    println!(
-        "{{\"model\":\"sysknife-pr695\",\"stream\":false,\"keep_alive\":\"30m\",\"messages\":[{{\"role\":\"system\",\"content\":{}}},{{\"role\":\"user\",\"content\":\"Acknowledge initialization briefly.\"}}],\"tools\":[{}],\"options\":{{\"num_predict\":1}}}}",
-        quote(&system), serialized.join(",")
-    );
+    let calls = Arc::new(AtomicUsize::new(0));
+    let planner = LlmPlanner::new(Box::new(Capture(calls.clone())), Box::new(NoQueries), 1)
+        .with_distro(DistroHint {id: "ubuntu".into(), family: DISTRO_FAMILY_DEBIAN,
+            version: Some("Ubuntu 24.04".into())});
+    let result = run(planner.plan_intent("Acknowledge initialization briefly."));
+    assert!(result.is_err(), "capture must never synthesize a plan");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }

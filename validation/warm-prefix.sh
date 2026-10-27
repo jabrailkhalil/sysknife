@@ -9,15 +9,28 @@ bash tests/e2e/ubuntu-vm.sh ssh 'bash -s' <<'GUEST'
 set -euo pipefail
 source /home/ubuntu/.cargo/env
 cd /home/ubuntu/sysknife
-shopt -s nullglob
-brain=(target/release/deps/libsysknife_brain-*.rlib)
-types=(target/release/deps/libsysknife_types-*.rlib)
-test "${#brain[@]}" = 1
-test "${#types[@]}" = 1
-rustc --edition=2021 -C opt-level=2 -L dependency=target/release/deps \
-  --extern "sysknife_brain=${brain[0]}" --extern "sysknife_types=${types[0]}" \
-  /tmp/pr695-warm-prefix.rs -o /tmp/pr695-warm-prefix
-/tmp/pr695-warm-prefix > /tmp/pr695-warm-prefix.json
+mkdir -p /tmp/pr695-prefix-generator/src
+cp /tmp/pr695-warm-prefix.rs /tmp/pr695-prefix-generator/src/main.rs
+cp Cargo.lock /tmp/pr695-prefix-generator/Cargo.lock
+cat > /tmp/pr695-prefix-generator/Cargo.toml <<'TOML'
+[package]
+name = "pr695-prefix-generator"
+version = "0.0.0"
+edition = "2021"
+[dependencies]
+sysknife-brain = { path = "/home/ubuntu/sysknife/crates/sysknife-brain" }
+sysknife-types = { path = "/home/ubuntu/sysknife/crates/sysknife-types" }
+async-trait = "0.1"
+serde_json = "1"
+TOML
+# Only the temporary helper lock is bootstrapped; the production lock and
+# source remain unchanged, and no new registry downloads are allowed.
+CARGO_TARGET_DIR="$PWD/target" cargo build --release --offline \
+  --manifest-path /tmp/pr695-prefix-generator/Cargo.toml
+CARGO_TARGET_DIR="$PWD/target" cargo build --release --offline --locked \
+  --manifest-path /tmp/pr695-prefix-generator/Cargo.toml
+git diff --exit-code
+target/release/pr695-prefix-generator > /tmp/pr695-warm-prefix.json
 GUEST
 bash tests/e2e/ubuntu-vm.sh ssh 'cat /tmp/pr695-warm-prefix.json' \
   > "../evidence/${arm}-initialization/request.json"
