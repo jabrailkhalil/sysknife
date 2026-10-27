@@ -62,7 +62,7 @@ jobs:
           pinned_install_ollama
           sudo systemctl stop ollama
           nohup env OLLAMA_HOST=127.0.0.1:11434 OLLAMA_CONTEXT_LENGTH=32768 \
-            OLLAMA_NUM_PARALLEL=1 OLLAMA_FLASH_ATTENTION=1 OLLAMA_KV_CACHE_TYPE=q8_0 \
+            OLLAMA_NUM_PARALLEL=1 LLAMA_ARG_CACHE_RAM=2048 \
             ollama serve > ../evidence/ollama.log 2>&1 &
           for attempt in $(seq 1 30); do
             if curl -sf http://127.0.0.1:11434/api/tags > /dev/null; then break; fi
@@ -92,6 +92,8 @@ jobs:
             -i "$SYSKNIFE_VM_SSH_KEY" -o IdentitiesOnly=yes -o BatchMode=yes \
             -p 2223 -R 11434:127.0.0.1:11434 ubuntu@127.0.0.1
           bash tests/e2e/ubuntu-vm.sh ssh 'curl -sf http://127.0.0.1:11434/api/tags'
+      - name: Initialize shared base prompt prefix with a neutral one-token request
+        run: bash ../harness/validation/warm-prefix.sh base
       - name: Live baseline probe for the affected autoremove scenario
         run: |
           set -euo pipefail
@@ -99,6 +101,8 @@ jobs:
           export SYSKNIFE_CASSETTE=/tmp/pr695-evidence/base-probe/calls.json
           bash tests/e2e/ubuntu-vm.sh run 60 2>&1 | tee ../evidence/base-probe.log
           bash tests/e2e/ubuntu-vm.sh ssh 'sudo tar -C /tmp/pr695-evidence -czf - .' > ../evidence/guest-probe.tar.gz
+          bash tests/e2e/ubuntu-vm.sh ssh 'sudo cat /tmp/pr695-evidence/base-probe/calls.json' > ../evidence/base-probe-calls.json
+          python3 -c 'import json,pathlib; s=pathlib.Path("../evidence/base-initialization/system-prompt.sha256").read_text().strip(); c=json.loads(pathlib.Path("../evidence/base-probe-calls.json").read_text()); assert s in c["meta"]["system_prompt_sha256"]'
       - name: Preserve the live probe before the full suite
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
@@ -120,6 +124,8 @@ jobs:
           set -euo pipefail
           bash tests/e2e/ubuntu-vm.sh ssh 'cd /home/ubuntu/sysknife && git checkout --detach b6b2704f6b2a515670fdc974b87e361f0b595adb && source /home/ubuntu/.cargo/env && cargo build --release -p sysknife-daemon -p sysknife-cli --locked && git diff --exit-code && sudo install -m 755 target/release/sysknife /usr/local/bin/sysknife && sudo install -m 755 target/release/sysknife-daemon /usr/local/bin/sysknife-daemon && sudo systemctl restart sysknife-daemon' 2>&1 | tee ../evidence/candidate-build.log
           bash tests/e2e/ubuntu-vm.sh ssh 'cd /home/ubuntu/sysknife && git rev-parse HEAD && sha256sum crates/sysknife-brain/src/prompt.rs crates/sysknife-daemon/tests/prompt_risk_labels.rs && systemctl is-active sysknife-daemon' | tee ../evidence/guest-candidate.txt
+      - name: Initialize shared PR prompt prefix with a neutral one-token request
+        run: bash ../harness/validation/warm-prefix.sh candidate
       - name: Run the complete Ubuntu story family on the PR head
         run: |
           set -euo pipefail
