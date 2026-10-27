@@ -27,7 +27,9 @@ impl LlmProvider for Capture {
                          {"role": "user", "content": "Acknowledge initialization briefly."}],
             "tools": tools, "options": {"num_predict": 1}
         }));
-        Err(ProviderError::Request("initialization request capture only".into()))
+        // Stop at the first provider boundary without returning a model reply
+        // or entering the planner's transport-error retry path.
+        std::future::pending().await
     }
 }
 
@@ -43,14 +45,12 @@ impl StateClient for NoQueries {
 
 struct NoopWake;
 impl Wake for NoopWake { fn wake(self: Arc<Self>) {} }
-fn run<F: Future>(future: F) -> F::Output {
+fn capture<F: Future>(future: F) {
     let waker = Waker::from(Arc::new(NoopWake));
     let mut context = Context::from_waker(&waker);
     let mut future = Box::pin(future);
-    loop {
-        if let Poll::Ready(output) = future.as_mut().poll(&mut context) { return output; }
-        std::thread::yield_now();
-    }
+    assert!(matches!(future.as_mut().poll(&mut context), Poll::Pending),
+        "capture must stop before any model reply");
 }
 
 fn main() {
@@ -58,7 +58,6 @@ fn main() {
     let planner = LlmPlanner::new(Box::new(Capture(calls.clone())), Box::new(NoQueries), 1)
         .with_distro(DistroHint {id: "ubuntu".into(), family: DISTRO_FAMILY_DEBIAN,
             version: Some("Ubuntu 24.04".into())});
-    let result = run(planner.plan_intent("Acknowledge initialization briefly."));
-    assert!(result.is_err(), "capture must never synthesize a plan");
+    capture(planner.plan_intent("Acknowledge initialization briefly."));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
