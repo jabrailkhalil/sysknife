@@ -97,10 +97,9 @@ jobs:
           result=${PIPESTATUS[0]}
           set -e
           printf '%s\n' "$result" > ../evidence/ci-local-exit.txt
-          ! grep -q '^FAIL ' ../evidence/ci-local.log
-          ! grep -q '^ci-local: FAIL' ../evidence/ci-local.log
-          ! grep -q 'missing-tool:' ../evidence/ci-local.log
-          ! grep -q '^SKIP .*postgres-contract' ../evidence/ci-local.log
+          if grep -E '^FAIL |^ci-local: FAIL|missing-tool:|^SKIP .*postgres-contract' ../evidence/ci-local.log; then
+            exit 1
+          fi
           if test "$result" != 0; then
             grep -q '^ci-local: INCOMPLETE' ../evidence/ci-local.log
             grep -q 'root-required:' ../evidence/ci-local.log
