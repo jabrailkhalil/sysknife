@@ -20,7 +20,7 @@ jobs:
       UBUNTU_VM_MEM: "4096"
       UBUNTU_VM_CPUS: "2"
       UBUNTU_VM_DISK: "28G"
-      SYSKNIFE_VM_SSH_KEY: ${{ runner.temp }}/sysknife-pr695-vm
+      SYSKNIFE_VM_SSH_KEY: ${{ github.workspace }}/sysknife-pr695-vm
       SYSKNIFE_LLM_PROVIDER: ollama
       SYSKNIFE_LLM_MODEL: sysknife-pr695
       SYSKNIFE_OLLAMA_URL: http://127.0.0.1:11434
