@@ -16,6 +16,8 @@ jobs:
       CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable (branch)
         with:
           toolchain: stable
@@ -27,7 +29,8 @@ jobs:
       - name: Apply uncommitted test patch to exact upstream base
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = 24ebd624b740debfb1614327b09e281cbcb8f496
+          git merge-base --is-ancestor 24ebd624b740debfb1614327b09e281cbcb8f496 HEAD
+          git diff --exit-code 24ebd624b740debfb1614327b09e281cbcb8f496 HEAD -- crates apps Cargo.toml Cargo.lock tests scripts
           git apply --check validation/risk-prose.patch
           git apply validation/risk-prose.patch
           git diff --check
