@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   validate:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     defaults:
       run:
@@ -29,7 +29,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           repository: lacs-project/sysknife
-          ref: 45d5bdff66984ff4231b98ebdca5260c53022774
+          ref: 25c9e76e6382966139cad7da93700644cb242ffd
           path: source
           persist-credentials: false
       - name: Install canonical Rust workspace prerequisites
@@ -52,11 +52,22 @@ jobs:
         uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91  # v2.87.31
         with:
           tool: cargo-nextest
+      - name: Measure the unmodified current-main workspace
+        run: |
+          set -euo pipefail
+          mkdir -p ../evidence
+          test "$(git rev-parse HEAD)" = 25c9e76e6382966139cad7da93700644cb242ffd
+          UPDATE_TEST_BASELINE=1 bash scripts/test_baseline.sh \
+            2>&1 | tee ../evidence/main-workspace-baseline.log
+          cp tests/evidence/workspace-tests.json ../evidence/main-measured-baseline.json
+          git diff --binary > ../evidence/main-generated.patch
+          git restore --worktree .
+          git diff --exit-code
       - name: Apply the unchanged two-file PR patch
         run: |
           set -euo pipefail
           mkdir -p ../evidence
-          test "$(git rev-parse HEAD)" = 45d5bdff66984ff4231b98ebdca5260c53022774
+          test "$(git rev-parse HEAD)" = 25c9e76e6382966139cad7da93700644cb242ffd
           git rev-parse HEAD > ../evidence/base-sha.txt
           git apply --check ../harness/validation/risk-prose.patch
           git apply ../harness/validation/risk-prose.patch
@@ -76,6 +87,46 @@ jobs:
           cargo fmt --all --check 2>&1 | tee ../evidence/format.log
           cargo clippy --workspace --all-features --all-targets --locked -- -D warnings \
             2>&1 | tee ../evidence/clippy.log
+      - name: Container guard and source-revert control
+        run: |
+          set -euo pipefail
+          prompt=crates/sysknife-brain/src/prompt.rs
+          cp "$prompt" ../evidence/prompt-approved.rs
+          trap 'cp ../evidence/prompt-approved.rs "$prompt"' EXIT
+          docker build -t sysknife-risk-guard:local -f ../harness/validation/guard.Dockerfile ../harness/validation
+          docker image inspect sysknife-risk-guard:local --format '{{.Id}}' > ../evidence/guard-image.txt
+          build_guard() {
+            cargo test -p sysknife-daemon --test prompt_risk_labels --locked --no-run \
+              --message-format=json > ../evidence/guard-build.jsonl || return $?
+            python3 - <<'PY'
+          import json
+          from pathlib import Path
+          events = [json.loads(line) for line in Path('../evidence/guard-build.jsonl').read_text().splitlines() if line.startswith('{')]
+          paths = {event['executable'] for event in events if event.get('reason') == 'compiler-artifact' and event.get('target', {}).get('name') == 'prompt_risk_labels' and event.get('executable')}
+          assert len(paths) == 1, paths
+          print(Path(next(iter(paths))).resolve())
+          PY
+          }
+          run_guard() {
+            docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
+              --user 65534:65534 --mount "type=bind,src=$1,dst=/guard,readonly" \
+              sysknife-risk-guard:local /guard --exact prose_risk_claims_match_the_action_specs --nocapture
+          }
+          binary="$(build_guard)"
+          run_guard "$binary" 2>&1 | tee ../evidence/container-positive.log
+          git show 25c9e76e6382966139cad7da93700644cb242ffd:"$prompt" > "$prompt"
+          binary="$(build_guard)"
+          set +e
+          run_guard "$binary" 2>&1 | tee ../evidence/container-reverted.log
+          status=${PIPESTATUS[0]}
+          set -e
+          test "$status" -eq 101
+          grep -F 'prose_risk_claims_match_the_action_specs ... FAILED' ../evidence/container-reverted.log
+          grep -F 'AptAutoremove' ../evidence/container-reverted.log
+          cp ../evidence/prompt-approved.rs "$prompt"
+          binary="$(build_guard)"
+          run_guard "$binary" 2>&1 | tee ../evidence/container-restored.log
+          sha256sum --check ../harness/validation/expected-source.sha256
       - name: Verify provenance, figures and scope
         run: |
           set -euo pipefail
@@ -93,8 +144,9 @@ jobs:
                       'tests/evidence/workspace-tests.json'}
           assert actual == expected, actual
           baseline = json.loads(pathlib.Path('tests/evidence/workspace-tests.json').read_text())
-          assert baseline['tests'] == 2093, baseline
-          assert baseline['frontend_tests'] == 72, baseline
+          main = json.loads(pathlib.Path('../evidence/main-measured-baseline.json').read_text())
+          assert baseline['tests'] == main['tests'] + 2, (main, baseline)
+          assert baseline['frontend_tests'] == main['frontend_tests'], (main, baseline)
           print(json.dumps({'changed_files': sorted(actual), 'generated_baseline': baseline}))
           PY
       - name: Preserve exact generated output and tested patch
